@@ -1,0 +1,6 @@
+#include "chapters/01-intro.typ"
+#include "chapters/02-design.typ"
+#include "chapters/03-implementation.typ"
+#include "chapters/04-ai-application.typ"
+#include "chapters/05-evaluation.typ"
+#include "chapters/06-conclusion.typ"
