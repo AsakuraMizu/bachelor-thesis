@@ -14,26 +14,133 @@ Rust 的模块与包管理机制天然强调依赖关系在编译期的静态确
 
 === 设计动机
 
-#todo[
-  简述 crate_interface 解决的问题（跨 crate 的接口定义与实现解耦），
-  指出其局限性（不支持复杂类型传递、RAII 语义受限），
-  对比 `Box<dyn Trait>`、`*mut ()` 等方案的不足，
-  引出 extern_trait 的设计目标。
-]
+在组件化操作系统开发中，跨 crate 的接口定义与实现解耦是一个核心需求。ArceOS 项目早期引入的 `crate_interface` 机制正是为解决这一问题而设计：它允许在一个 crate 中定义 trait 接口，在另一个 crate 中提供实现，然后通过链接器符号在运行时连接。这种方式成功避免了循环依赖，使底层模块能够调用上层提供的能力，例如日志模块调用平台层提供的 `console_write_str` 函数。
+
+然而，`crate_interface` 的设计存在若干局限性。首先，它不支持带接收者参数的方法（`&self`、`&mut self`），只能定义关联函数，因此无法表达具有状态的接口。更重要的是，它无法自动处理 RAII 语义——当实现类型需要资源清理时，调用方必须显式调用某种 `drop` 方法，这不仅破坏了 Rust 的所有权语义，也增加了使用复杂度。
+
+面对这些局限，常见的替代方案也存在明显缺陷。`Box<dyn Trait>` 虽然能完整表达 trait 语义，但需要堆分配每个 trait 对象，且每次方法调用都要经过 vtable 进行间接寻址，在内核性能敏感路径上代价过高。另一种极端方案是使用 `*mut ()` 进行手动类型擦除，这虽然避免了堆分配和间接调用，但完全依赖 unsafe 代码进行类型转换，极易引入内存安全漏洞。这些方案要么牺牲性能，要么牺牲安全性，难以满足操作系统内核的需求。
+
+值得注意的是，Rust 语言团队正在推进的 EII（Externally Implementable Items）特性试图从语言层面解决类似问题。该特性采用属性语法，使用 `#[eii(...)]` 定义可外部实现的函数或静态变量，使用同名属性提供实现，类似于 `#[panic_handler]` 和 `#[global_allocator]` 的机制。但这一特性的 RFC 尚未正式合并，目前仅处于实验阶段（`#![feature(extern_item_impls)]`），且仅支持函数而非完整的 trait 语义。因此，StarryOS 需要一种既能获得完整 trait 语义，又不依赖 nightly 特性的解决方案。
+
+`extern_trait` 机制正是在这一背景下设计的。它的核心目标是：在不依赖语言层面修改的前提下，通过过程宏实现零开销的跨 crate trait 调用，支持带接收者的方法、自动 RAII 处理，并保持完整的类型安全。与 Rust 官方的 EII 特性相比，它作为第三方库可在 stable Rust 上使用，并且提供更完整的 trait 支持；与传统的动态分派方案相比，它在编译期完成所有决议，在链接时绑定具体实现，避免了任何运行时开销。
 
 === 实现原理
 
-#todo[
-  说明 extern_trait 的核心思想：通过过程宏在编译期生成调用桩，
-  实现零开销的跨 crate 接口调用，支持任意类型和 RAII 语义。可附代码示例。
-]
+`extern_trait` 的实现基于一个核心观察：在大多数调用约定中，大小不超过两个指针的结构体可以通过寄存器直接传递，无需经过栈内存。这一观察启发了一种"静态 vtable"的设计思路——将 trait 的方法分派从运行时的间接调用转变为链接时的直接符号绑定。
+
+具体而言，`extern_trait` 通过过程宏完成三方面的工作。首先，在 trait 定义侧，宏生成一个固定大小的代理类型 `Repr`，其大小为两个指针（16 字节在 64 位平台，8 字节在 32 位平台），足以存储大多数常见的实现类型，如 `Box<T>`、`Arc<T>`、`&T` 以及胖指针 `&[T]`、`&str` 等。宏同时为该代理类型生成 trait 实现，其中每个方法都被替换为对外部符号的调用：
+
+```rust
+// 定义侧生成的代码（简化）
+#[repr(transparent)]
+pub struct HelloProxy(extern_trait::Repr);
+
+impl Hello for HelloProxy {
+    fn new(arg: i32) -> Self {
+        extern "Rust" {
+            #[link_name = "extern_trait_Hello_new"]
+            fn __new(arg: i32) -> Repr;
+        }
+        Self(unsafe { __new(arg) })
+    }
+
+    fn hello(&self) {
+        extern "Rust" {
+            #[link_name = "extern_trait_Hello_hello"]
+            fn __hello(this: &Repr);
+        }
+        unsafe { __hello(&self.0) }
+    }
+}
+
+impl Drop for HelloProxy {
+    fn drop(&mut self) {
+        extern "Rust" {
+            #[link_name = "extern_trait_Hello_drop"]
+            fn __drop(this: *mut Repr);
+        }
+        unsafe { __drop(&mut self.0 as *mut _) }
+    }
+}
+```
+
+其次，在 trait 实现侧，宏生成对应的符号导出函数。每个 trait 方法都被包装为一个带有 `#[export_name]` 属性的函数，该函数接收 `Repr` 类型的参数，在其中完成实际实现类型的构造或方法调用：
+
+```rust
+// 实现侧生成的代码（简化）
+struct HelloImpl(i32);
+
+#[export_name = "extern_trait_Hello_new"]
+extern "Rust" fn __new(arg: i32) -> Repr {
+    Repr::from_value(HelloImpl::new(arg))
+}
+
+#[export_name = "extern_trait_Hello_hello"]
+extern "Rust" fn __hello(this: &Repr) {
+    let impl_ref: &HelloImpl = this.as_ref();
+    impl_ref.hello();
+}
+
+#[export_name = "extern_trait_Hello_drop"]
+extern "Rust" fn __drop(this: *mut Repr) {
+    unsafe { ptr::drop_in_place(this.as_mut::<HelloImpl>()) };
+}
+```
+
+最后，宏在编译期进行大小检查，确保实现类型能够容纳于 `Repr` 中。如果实现类型过大，编译时会触发静态断言错误，引导用户将类型包装在 `Box` 或其他指针类型中。
+
+这种设计的关键优势在于：代理类型与实现类型之间通过链接器符号进行连接，而非通过运行时的 vtable。当调用方调用 `HelloProxy::hello()` 时，编译器生成的代码直接跳转到 `__hello` 符号，该符号在链接时被解析为实现 crate 中导出的函数地址。这消除了动态分派的开销，同时保持了完整的类型安全——所有类型转换都在宏生成的代码中完成，用户代码无需使用 unsafe。
+
+对于 supertrait 的处理，宏会自动为代理类型生成相应的 trait 实现。例如，如果 trait 定义为 `trait Resource: Send + Sync + Clone + Debug`，则 `ResourceProxy` 会自动获得 `Send`、`Sync`、`Clone` 和 `Debug` 的实现，这些实现同样通过外部符号绑定，确保实现 crate 中提供的 supertrait 实现被正确传递。
 
 === 应用场景
 
-#todo[
-  列举在 StarryOS 中的具体应用（TaskExt、on_enter/on_leave/drop 等），
-  以及已发布/计划发布到 crates.io 的情况（extern-trait crate）。
-]
+`extern_trait` 机制在 ArceOS 和 StarryOS 中有着广泛的应用，其中最具代表性的场景是任务扩展机制（`TaskExt`）。
+
+在 ArceOS 的调度器模块 `axtask` 中，`TaskExt` trait 被定义为任务切换时的回调接口：
+
+```rust
+#[extern_trait(pub AxTaskExt)]
+pub trait TaskExt {
+    fn on_enter(&self) {}
+    fn on_leave(&self) {}
+}
+```
+
+这一设计允许上层模块（如 StarryOS 的进程管理）向下层模块（调度器）注入任务切换时的自定义逻辑。在 StarryOS 中，`TaskExt` 被实现为 `Box<Thread>`，用于管理进程相关的上下文切换：
+
+```rust
+#[extern_trait]
+impl TaskExt for Box<Thread> {
+    fn on_enter(&self) {
+        let scope = self.proc_data.scope.read();
+        unsafe { ActiveScope::set(&scope) };
+        core::mem::forget(scope);
+    }
+
+    fn on_leave(&self) {
+        ActiveScope::set_global();
+        unsafe { self.proc_data.scope.force_read_decrement() };
+    }
+}
+```
+
+通过这一机制，当调度器切换任务时，会自动调用 `on_enter` 和 `on_leave` 方法，完成进程资源作用域的切换。调度器模块无需了解进程管理的具体实现，只需在 `TaskInner` 结构中存储 `Option<AxTaskExt>` 字段，并在任务切换时调用相应方法即可。这种设计实现了底层调度逻辑与上层进程管理的完全解耦。
+
+另一个重要应用是用户态内存访问接口 `VmIo`。在 StarryOS 的架构中，内存管理与内核核心高度相关，但信号处理等组件（`starry-signal`）也需要访问用户内存。为避免循环依赖，同时为后续的异常修复机制提供统一入口，引入了 `VmIo` trait。通过 `extern_trait`，`Vm` 类型可以作为跨模块的内存访问接口被传递和调用：
+
+```rust
+#[extern_trait]
+unsafe impl VmIo for Vm {
+    fn new() -> Self { Self(IrqSave::new()) }
+    fn read(&mut self, start: usize, buf: &mut [MaybeUninit<u8>]) -> VmResult { ... }
+    fn write(&mut self, start: usize, buf: &[u8]) -> VmResult { ... }
+}
+```
+
+这使得文件系统、驱动、信号处理等模块可以在不依赖具体内存管理实现的情况下，通过统一的接口访问用户态数据，同时也为后续介绍的异常修复机制提供了接口层面的支撑。
+
+目前，`extern_trait` 已作为独立 crate 发布于 crates.io @extern_trait，由本文作者开发维护。其设计灵感来源于 `crate_interface` 机制，但在功能完整性、类型安全和性能方面均有显著改进。随着 Rust 语言层面 EII 特性的推进，未来可能存在语言原生支持与库层实现之间的融合或迁移，但 `extern_trait` 在当下已为组件化操作系统开发提供了一种切实可用的解决方案。
 
 == 用户态切换与反转控制流
 
@@ -45,17 +152,63 @@ Rust 的模块与包管理机制天然强调依赖关系在编译期的静态确
 
 === 反转控制流设计
 
-#todo[
-  说明 StarryOS 的设计：内核代码“调用”用户程序，主动控制用户程序流，
-  对比 Asterinas 的类似思路，说明其对组件化架构的意义。
-]
+StarryOS 采用了一种与传统宏内核不同的控制流组织方式。在传统模型中，用户程序通过系统调用主动进入内核，内核被动响应请求后返回用户态继续执行。这种被动响应模式虽然直观，但难以将用户态切换、任务调度、信号处理等逻辑组织为可复用的组件——它们往往分散在异常处理入口、系统调用路径、调度器等多个位置，通过隐式约定相互协调。
+
+StarryOS 的设计则将控制权反转：内核代码主动"调用"用户程序，而非被动等待用户程序的调用。具体而言，每个用户任务的入口函数并非用户程序的 `main` 函数，而是一个内核循环，其核心结构如下：
+
+```rust
+while !thread.pending_exit() {
+    let reason = user_context.run();  // 进入用户态
+
+    match reason {
+        ReturnReason::Syscall => handle_syscall(&mut user_context),
+        ReturnReason::PageFault(addr, flags) => handle_page_fault(...),
+        ReturnReason::Exception(info) => handle_exception(...),
+        ReturnReason::Interrupt => {}
+    }
+
+    check_signals(&thread, &mut user_context);  // 处理信号
+}
+```
+
+`user_context.run()` 是整个设计的关键：它将处理器从内核态切换到用户态，开始执行用户代码，直到发生系统调用、异常或中断时返回。返回后，内核在一个集中的位置处理各类事件，然后再次调用 `run()` 继续用户态执行。这种设计使内核能够以统一的方式组织控制流，而非在多个入口点分散处理。
+
+这一设计思路与 Asterinas 项目@asterinas2024 的 `UserMode::execute()` 机制相似。Asterinas 同样采用内核主动调用用户程序的模式，其任务入口函数中包含一个循环，在每次用户态返回后处理系统调用、异常和信号。两个项目的设计都体现了将控制流逻辑集中化的思路，这为组件化架构提供了便利：信号处理、地址空间切换、FPU 状态管理等逻辑可以通过调度器回调（如前文所述的 `TaskExt::on_enter`/`on_leave`）注入到任务切换路径中，而非散落在各个异常处理入口。
 
 === 基于 axcpu 的实现
 
-#todo[
-  简述 axcpu 组件的职责（封装用户态/内核态切换的底层机制），
-  说明实现难点及关键设计决策。
-]
+axcpu 组件负责封装用户态与内核态切换的底层机制。它为每种支持的架构（RISC-V、x86\_64、AArch64、LoongArch64）提供了一致的接口，主要包括：
+
+- `UserContext`：封装用户态的寄存器状态，包括通用寄存器、程序计数器、栈指针以及架构特定的状态（如 RISC-V 的 `sstatus`、x86\_64 的段寄存器基址）
+- `run()` 方法：执行用户态切换，返回 `ReturnReason` 枚举指示返回原因
+- `TrapFrame`：异常帧结构，保存陷入内核时的完整寄存器状态
+
+核心的用户态进入逻辑由汇编代码实现。以 RISC-V 为例，`enter_user` 函数的执行流程如下：
+
+```
+enter_user:
+    # 保存内核态 callee-saved 寄存器
+    addi    sp, sp, -16 * XLENB
+    STR     s0, sp, 0
+    ...
+    STR     ra, sp, 12
+
+    # 设置用户态入口
+    csrw    sepc, t0          # 设置返回地址
+    csrw    sstatus, t1       # 设置状态寄存器（SPP=0 表示返回用户态）
+
+    # 恢复用户态寄存器
+    POP_GENERAL_REGS
+    LDR     sp, sp, 2         # 切换到用户态栈
+
+    sret                      # 返回用户态
+```
+
+` sret` 指令将处理器从 S 模式切换到 U 模式，开始执行用户程序。当用户程序执行系统调用（`ecall` 指令）或发生异常时，处理器重新陷入 S 模式，跳转到 trap 向量入口。trap 处理代码根据 `scause` 寄存器判断陷入原因，构造 `ReturnReason` 并返回 Rust 代码。
+
+x86\_64 架构的实现略有不同。由于 x86\_64 使用 `syscall`/`sysret` 指令进行系统调用入口和返回，而非通过统一的异常入口，axcpu 需要分别处理：`syscall` 指令跳转到 MSR `LSTAR` 指定的入口点，而异常则通过 IDT 进入 trap 处理代码。此外，x86\_64 需要处理 FS/GS 段寄存器基址的切换——用户态和内核态可能使用不同的 TLS 基址，这需要在进入和离开用户态时通过 `wrmsr`/`rdmsr` 操作 `KERNEL_GS_BASE` MSR。
+
+axcpu 的设计目标是将这些架构差异封装在组件内部，向上层提供统一的接口。这使得 ArceOS/StarryOS 的内核代码无需关心底层的寄存器操作细节，只需调用 `UserContext::run()` 即可完成用户态切换。同时，axcpu 也提供了 `TrapFrame` 结构的访问接口，使系统调用处理代码能够读取和修改用户态寄存器（如系统调用参数和返回值），实现了跨架构的统一抽象。
 
 == 高效内核-用户交互机制
 

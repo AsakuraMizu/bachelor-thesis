@@ -24,7 +24,7 @@ AIoT 场景兼具通用计算与嵌入式计算的双重特征。一方面，边
 
 === Starry OS 的发展
 
-#todo[梳理 Starry-Next → Starry Mix → StarryOS 主线的演进历程]
+#todo[梳理 Starry-Old →  Starry-Next → Starry Mix → StarryOS 主线的演进历程]
 
 == 问题陈述
 
@@ -42,12 +42,11 @@ AIoT 场景兼具通用计算与嵌入式计算的双重特征。一方面，边
 
 == 相关工作
 
-#todo[
-  每类2-3句话即可：
-  - 其他 Rust OS：Asterinas（Framekernel）、Theseus、Tock
-  - Linux 兼容性内核：gVisor、Graphene/Occlum（TEE场景）
-  - 性能优化相关：io_uring、CortenMM（SOSP'25最佳论文）
-]
+在 Rust 操作系统方面，Asterinas 提出 framekernel 架构，通过内核内部特权分离实现最小的可信计算基，以安全 Rust 实现完整的 Linux ABI 兼容性@asterinas-paper。Theseus 探索 intralingual 设计原则，将操作系统职责通过语言级机制委托给编译器，实现细粒度组件化和运行时动态演化@boos2020theseus。Tock 面向嵌入式微控制器场景，通过 Rust 的类型安全实现内核与应用的隔离，支持在资源受限设备上安全运行多个互不信任的应用@levy2017tock，并已在超过一千万台设备上部署应用@schuermann2025tock。
+
+在 Linux 兼容性内核方面，gVisor 采用用户态内核（application kernel）架构，以 Go 语言实现 Linux 系统调用接口，为容器提供强隔离沙箱环境@gvisor。Graphene（现名 Gramine）和 Occlum 均面向可信执行环境（TEE）场景，通过库操作系统（library OS）方式在 Intel SGX enclave 内运行多进程 Linux 应用@tsai2017graphene，后者以 Rust 实现内存安全@shen2020occlum。
+
+在性能优化方面，CortenMM 针对虚拟内存管理的正确性开销问题，提出取消独立 VMA 抽象的设计，在保持强正确性保证的同时显著提升内存管理效率，获得 SOSP 2025 最佳论文奖@cortenmm。
 
 == 本文工作
 
